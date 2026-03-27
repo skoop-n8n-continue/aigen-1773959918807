@@ -11,6 +11,22 @@ const NETWORK_ONLY_HOSTS = [
   'wttr.in',
 ];
 
+// ---------------------------------------------------------------------------
+// Refresh window: when refresh=true is seen on any request, all subsequent
+// fetches for the next 10 seconds also bypass cache. This cascades refresh
+// from index.html to all sub-resources (data.json, CSS, images, etc.)
+// without relying on Referer headers which are unreliable in iframes.
+// ---------------------------------------------------------------------------
+let refreshWindowUntil = 0;
+
+function isInRefreshWindow() {
+  return Date.now() < refreshWindowUntil;
+}
+
+function startRefreshWindow() {
+  refreshWindowUntil = Date.now() + 10000; // 10 second window
+}
+
 function isNetworkOnly(url) {
   try {
     const host = new URL(url).hostname;
@@ -35,15 +51,6 @@ function hasRefreshParam(url) {
   } catch (_) {
     return false;
   }
-}
-
-function shouldRefresh(request) {
-  if (hasRefreshParam(request.url)) return true;
-  try {
-    const referer = request.referrer || '';
-    if (referer && new URL(referer).searchParams.get('refresh') === 'true') return true;
-  } catch (_) {}
-  return false;
 }
 
 function normalizeUrl(url) {
@@ -90,7 +97,7 @@ self.addEventListener('activate', event => {
 // Strategy priority:
 //   1. Non-GET requests            — pass through unchanged
 //   2. Network-only hosts          — always fetch from network, never cache
-//   3. ?refresh=true (URL/referer) — bust cache entry, fetch fresh, re-cache
+//   3. ?refresh=true (or window)   — bust cache entry, fetch fresh, re-cache
 //   4. index.html                  — network-first (picks up new deployments)
 //   5. Everything else             — cache-first, fallback to network then cache
 // ---------------------------------------------------------------------------
@@ -107,14 +114,21 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // 2. ?refresh=true (on URL or referer) — bust cache entry, fetch fresh, re-cache
-  if (shouldRefresh(request)) {
+  // 2. ?refresh=true OR inside refresh window — bust cache, fetch fresh, re-cache
+  const explicitRefresh = hasRefreshParam(url);
+  if (explicitRefresh || isInRefreshWindow()) {
+    // If this is the explicit refresh=true request, start the window
+    // so all subsequent sub-resource fetches also get refreshed
+    if (explicitRefresh) startRefreshWindow();
+
     const normalized = normalizeUrl(url);
     event.respondWith(
       caches.open(CACHE_NAME).then(async cache => {
         await cache.delete(normalized);
         try {
-          const fresh = await fetch(normalized);
+          // cache: 'no-store' bypasses the browser's HTTP cache so we
+          // actually hit the server, not a stale HTTP-cached S3 response
+          const fresh = await fetch(normalized, { cache: 'no-store' });
           if (fresh.ok) await cache.put(normalized, fresh.clone());
           return fresh;
         } catch (_) {
